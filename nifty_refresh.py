@@ -1,0 +1,777 @@
+"""
+NIFTY Index Performance Dashboard — Weekly Refresh Script
+----------------------------------------------------------
+Run every Friday after 5:00 PM IST.
+- Fetches weekly closes for all NIFTY indices + constituent stocks
+- Reads stocks.txt (one ticker per line, e.g. HDFCBANK or HDFCBANK.NS)
+  and shows a pinned "My Watchlist" row at the top of the dashboard
+- Saves nifty_data.csv, nifty_stocks_data.csv, nifty_watchlist_data.csv
+- Opens interactive dashboard — click any index / watchlist to drill into stocks
+
+Requirements (install once):
+    pip install yfinance pandas requests
+
+Usage:
+    python nifty_refresh.py
+
+stocks.txt format (one ticker per line, # lines are comments):
+    # My picks
+    HDFCBANK
+    RELIANCE
+    INFY
+    DIXON          <- .NS appended automatically if missing
+"""
+
+import yfinance as yf
+import pandas as pd
+import json, os, sys, webbrowser
+from datetime import datetime
+
+# ── Index definitions ─────────────────────────────────────────────────────────
+INDICES = [
+    ("Nifty 50",           "^NSEI"),
+    ("Nifty Next 50",      "^NSMIDCP"),
+    ("Nifty 100",          "^CNX100"),
+    ("Nifty 200",          "^CNX200"),
+    ("Nifty 500",          "^CNX500"),
+    ("Nifty Midcap 50",    "^NSEMDCP50"),
+    ("Nifty Midcap 100",   "NIFTY_MIDCAP_100.NS"),
+    ("Nifty Smallcap 100", "NIFTYSMLCAP100.NS"),
+    ("Nifty Smallcap 250", "NIFTYSMLCAP250.NS"),
+    ("Nifty Bank",         "^NSEBANK"),
+    ("Nifty IT",           "^CNXIT"),
+    ("Nifty Auto",         "^CNXAUTO"),
+    ("Nifty FMCG",         "^CNXFMCG"),
+    ("Nifty Pharma",       "^CNXPHARMA"),
+    ("Nifty Fin Service",  "NIFTY_FIN_SERVICE.NS"),
+    ("Nifty Metal",        "^CNXMETAL"),
+    ("Nifty Realty",       "^CNXREALTY"),
+    ("Nifty Energy",       "^CNXENERGY"),
+    ("Nifty Media",        "^CNXMEDIA"),
+    ("Nifty Infra",        "^CNXINFRA"),
+    ("Nifty PSE",          "^CNXPSE"),
+    ("Nifty PSU Bank",     "^CNXPSUBANK"),
+    ("Nifty Consumption",  "^CNXCONSUM"),
+    ("Nifty Commodities",  "^CNXCMDT"),
+    ("Nifty Services",     "^CNXSERVICE"),
+    ("Nifty MNC",          "^CNXMNC"),
+    ("Nifty CPSE",         "NIFTYCPSE.NS"),
+    ("Nifty Healthcare",   "NIFTYHEALTHCARE.NS"),
+    ("Nifty India Mfg",    "NIFTYINDIAMFG.NS"),
+]
+
+# ── Constituent stocks per index (Yahoo Finance .NS tickers) ──────────────────
+CONSTITUENTS = {
+    "Nifty 50": [
+        "ADANIENT.NS","ADANIPORTS.NS","APOLLOHOSP.NS","ASIANPAINT.NS","AXISBANK.NS",
+        "BAJAJ-AUTO.NS","BAJFINANCE.NS","BAJAJFINSV.NS","BEL.NS","BPCL.NS",
+        "BHARTIARTL.NS","BRITANNIA.NS","CIPLA.NS","COALINDIA.NS","DRREDDY.NS",
+        "EICHERMOT.NS","GRASIM.NS","HCLTECH.NS","HDFCBANK.NS","HDFCLIFE.NS",
+        "HEROMOTOCO.NS","HINDALCO.NS","HINDUNILVR.NS","ICICIBANK.NS","ITC.NS",
+        "INDUSINDBK.NS","INFY.NS","JSWSTEEL.NS","KOTAKBANK.NS","LT.NS",
+        "LTIMIND.NS","M&M.NS","MARUTI.NS","NESTLEIND.NS","NTPC.NS",
+        "ONGC.NS","POWERGRID.NS","RELIANCE.NS","SBILIFE.NS","SHRIRAMFIN.NS",
+        "SBIN.NS","SUNPHARMA.NS","TCS.NS","TATACONSUM.NS","TMPV.NS",
+        "TATASTEEL.NS","TECHM.NS","TITAN.NS","ULTRACEMCO.NS","WIPRO.NS",
+    ],
+    "Nifty Bank": [
+        "AUBANK.NS","AXISBANK.NS","BANDHANBNK.NS","FEDERALBNK.NS","HDFCBANK.NS",
+        "ICICIBANK.NS","IDFCFIRSTB.NS","INDUSINDBK.NS","KOTAKBANK.NS","PNB.NS",
+        "SBIN.NS","BANKBARODA.NS",
+    ],
+    "Nifty IT": [
+        "COFORGE.NS","HCLTECH.NS","INFY.NS","LTIMIND.NS","MPHASIS.NS",
+        "PERSISTENT.NS","TCS.NS","TECHM.NS","WIPRO.NS","OFSS.NS",
+    ],
+    "Nifty Auto": [
+        "APOLLOTYRE.NS","ASHOKLEY.NS","BAJAJ-AUTO.NS","BALKRISIND.NS","BHARATFORG.NS",
+        "BOSCHLTD.NS","EICHERMOT.NS","HEROMOTOCO.NS","M&M.NS","MARUTI.NS",
+        "MOTHERSON.NS","MRF.NS","TMPV.NS","TVSMOTOR.NS","TIINDIA.NS",
+    ],
+    "Nifty FMCG": [
+        "BRITANNIA.NS","COLPAL.NS","DABUR.NS","GODREJCP.NS","HINDUNILVR.NS",
+        "ITC.NS","MARICO.NS","NESTLEIND.NS","TATACONSUM.NS","UBL.NS",
+        "UNITDSPR.NS","RADICO.NS","EMAMILTD.NS","PGHH.NS","VBL.NS",
+    ],
+    "Nifty Pharma": [
+        "AUROPHARMA.NS","CIPLA.NS","DIVISLAB.NS","DRREDDY.NS","GLENMARK.NS",
+        "GRANULES.NS","IPCALAB.NS","LAURUSLABS.NS","LUPIN.NS","SUNPHARMA.NS",
+        "TORNTPHARM.NS","ALKEM.NS","BIOCON.NS","ABBOTINDIA.NS","MANKIND.NS",
+    ],
+    "Nifty Metal": [
+        "ADANIENT.NS","APLAPOLLO.NS","COALINDIA.NS","HINDALCO.NS","HINDCOPPER.NS",
+        "JSWSTEEL.NS","NATIONALUM.NS","NMDC.NS","SAIL.NS","TATASTEEL.NS",
+        "VEDL.NS","WELCORP.NS","MOIL.NS","APLAPOLLO.NS","RATNAMANI.NS",
+    ],
+    "Nifty Realty": [
+        "BRIGADE.NS","DLF.NS","GODREJPROP.NS","LODHA.NS","MAHLIFE.NS",
+        "OBEROIRLTY.NS","PHOENIXLTD.NS","PRESTIGE.NS","SOBHA.NS","SUNTECK.NS",
+    ],
+    "Nifty Energy": [
+        "ADANIGREEN.NS","ADANIPOWER.NS","BPCL.NS","GAIL.NS","IOC.NS",
+        "NTPC.NS","ONGC.NS","POWERGRID.NS","RELIANCE.NS","TATAPOWER.NS",
+    ],
+    "Nifty PSU Bank": [
+        "BANKBARODA.NS","CANBK.NS","INDIANB.NS","IOB.NS","PNB.NS",
+        "SBIN.NS","UCOBANK.NS","UNIONBANK.NS","MAHABANK.NS","BANKINDIA.NS",
+    ],
+    "Nifty Fin Service": [
+        "AXISBANK.NS","BAJFINANCE.NS","BAJAJFINSV.NS","CHOLAFIN.NS","HDFCBANK.NS",
+        "HDFCLIFE.NS","ICICIBANK.NS","ICICIGI.NS","KOTAKBANK.NS","LICHSGFIN.NS",
+        "M&MFIN.NS","MUTHOOTFIN.NS","PFC.NS","RECLTD.NS","SBICARD.NS",
+        "SBILIFE.NS","SHRIRAMFIN.NS",
+    ],
+    "Nifty Infra": [
+        "ADANIPORTS.NS","ADANIGREEN.NS","BHARTIARTL.NS","BPCL.NS","GAIL.NS",
+        "GMRAIRPORT.NS","IOC.NS","IRB.NS","LT.NS","NTPC.NS",
+        "ONGC.NS","POWERGRID.NS","RELIANCE.NS","TATAPOWER.NS","NBCC.NS",
+    ],
+    "Nifty Healthcare": [
+        "APOLLOHOSP.NS","CIPLA.NS","DIVISLAB.NS","DRREDDY.NS","FORTIS.NS",
+        "LALPATHLAB.NS","LUPIN.NS","MAXHEALTH.NS","METROPOLIS.NS","SUNPHARMA.NS",
+        "TORNTPHARM.NS","AUROPHARMA.NS","MANKIND.NS",
+    ],
+    "Nifty PSE": [
+        "BPCL.NS","COALINDIA.NS","GAIL.NS","HINDPETRO.NS","IOC.NS",
+        "NTPC.NS","ONGC.NS","POWERGRID.NS","SAIL.NS","SBIN.NS",
+        "BEL.NS","BHEL.NS","HAL.NS","NMDC.NS","RECLTD.NS",
+    ],
+    "Nifty Media": [
+        "PVRINOX.NS","SUNTV.NS","ZEEL.NS","NAZARA.NS","TVTODAY.NS",
+        "NETWORK18.NS","JAGRAN.NS","SAREGAMA.NS","TIPSMUSIC.NS","DISHTV.NS",
+    ],
+}
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+SCRIPT_DIR         = os.path.dirname(os.path.abspath(__file__))
+CSV_INDEX_PATH     = os.path.join(SCRIPT_DIR, "nifty_data.csv")
+CSV_STOCKS_PATH    = os.path.join(SCRIPT_DIR, "nifty_stocks_data.csv")
+CSV_WATCHLIST_PATH = os.path.join(SCRIPT_DIR, "nifty_watchlist_data.csv")
+HTML_PATH          = os.path.join(SCRIPT_DIR, "index.html")
+WATCHLIST_FILE     = os.path.join(SCRIPT_DIR, "stocks.txt")
+WATCHLIST_KEY      = "\u2605 My Watchlist"   # ★ My Watchlist
+
+# ── Core fetch ────────────────────────────────────────────────────────────────
+def fetch_weekly(ticker):
+    raw = yf.download(ticker, period="1y", interval="1wk",
+                      progress=False, auto_adjust=True)
+    if raw.empty or len(raw) < 3:
+        return None
+    if isinstance(raw.columns, pd.MultiIndex):
+        col = raw["Close"]
+        if isinstance(col, pd.DataFrame):
+            col = col.iloc[:, 0]
+    else:
+        col = raw["Close"]
+    closes = col.dropna()
+    rows = []
+    for dt, close in closes.items():
+        date_str = dt.strftime("%Y-%m-%d") if hasattr(dt, "strftime") else str(dt)[:10]
+        rows.append({"date": date_str, "close": round(float(close), 2)})
+    return rows
+
+# ── Fetch all indices ─────────────────────────────────────────────────────────
+def fetch_indices():
+    all_rows, total = [], len(INDICES)
+    for i, (name, ticker) in enumerate(INDICES, 1):
+        print(f"  [{i:2d}/{total}] {name} ({ticker}) ... ", end="", flush=True)
+        try:
+            rows = fetch_weekly(ticker)
+            if not rows:
+                print("no data"); continue
+            for r in rows:
+                all_rows.append({"index_name": name, "ticker": ticker, **r})
+            print(f"OK  ({len(rows)} weeks)")
+        except Exception as e:
+            print(f"ERROR: {e}")
+    return pd.DataFrame(all_rows)
+
+# ── Fetch constituent stocks ──────────────────────────────────────────────────
+def fetch_stocks():
+    all_rows = []
+    items = list(CONSTITUENTS.items())
+    for idx_i, (index_name, stocks) in enumerate(items, 1):
+        print(f"\n  [{idx_i}/{len(items)}] {index_name} — {len(stocks)} stocks")
+        for j, ticker in enumerate(stocks, 1):
+            short = ticker.replace(".NS", "")
+            print(f"      [{j:2d}/{len(stocks)}] {short} ... ", end="", flush=True)
+            try:
+                rows = fetch_weekly(ticker)
+                if not rows:
+                    print("no data"); continue
+                for r in rows:
+                    all_rows.append({
+                        "index_name": index_name,
+                        "stock_ticker": ticker,
+                        "stock_name": short,
+                        **r
+                    })
+                print(f"OK ({len(rows)} wks)")
+            except Exception as e:
+                print(f"ERROR: {e}")
+    return pd.DataFrame(all_rows)
+
+# ── Load & fetch watchlist ────────────────────────────────────────────────────
+def load_watchlist():
+    """Read stocks.txt; return list of .NS tickers. Returns [] if file missing."""
+    if not os.path.exists(WATCHLIST_FILE):
+        return []
+    tickers = []
+    with open(WATCHLIST_FILE, encoding="utf-8") as f:
+        for line in f:
+            raw = line.strip()
+            if not raw or raw.startswith("#"):
+                continue
+            t = raw.upper()
+            if not t.endswith(".NS") and not t.startswith("^"):
+                t += ".NS"
+            tickers.append(t)
+    return tickers
+
+def fetch_watchlist(tickers):
+    """Fetch weekly data for watchlist tickers. Returns DataFrame same shape as stk_df."""
+    all_rows = []
+    total = len(tickers)
+    for j, ticker in enumerate(tickers, 1):
+        short = ticker.replace(".NS", "")
+        print(f"      [{j:2d}/{total}] {short} ... ", end="", flush=True)
+        try:
+            rows = fetch_weekly(ticker)
+            if not rows:
+                print("no data"); continue
+            for r in rows:
+                all_rows.append({
+                    "index_name": WATCHLIST_KEY,
+                    "stock_ticker": ticker,
+                    "stock_name": short,
+                    **r
+                })
+            print(f"OK ({len(rows)} wks)")
+        except Exception as e:
+            print(f"ERROR: {e}")
+    return pd.DataFrame(all_rows)
+def compute_stats(df, name_col="index_name"):
+    results = []
+    for name, group in df.groupby(name_col, sort=False):
+        g = group.sort_values("date").reset_index(drop=True)
+        closes = g["close"].tolist()
+        n = len(closes)
+        if n < 3:
+            continue
+        cur = closes[-1]
+        w   = lambda k: closes[-1-k] if n > k else None
+        pct = lambda a, b: round(((a-b)/b)*100, 2) if a and b and b != 0 else None
+        r1w = pct(cur, w(1)); r1m = pct(cur, w(4))
+        r3m = pct(cur, w(13)); r6m = pct(cur, w(26))
+        r1y = pct(cur, closes[0])
+        mom = []
+        for k in range(10, 0, -1):
+            a, b = w(k-1), w(k)
+            if a is None or b is None: mom.append(0)
+            else: mom.append(1 if a > b else (-1 if a < b else 0))
+        score = sum(mom)
+        results.append({
+            "name": name, "cur": cur,
+            "r1w": r1w, "r1m": r1m, "r3m": r3m, "r6m": r6m, "r1y": r1y,
+            "mom": mom, "score": score,
+        })
+    return sorted(results, key=lambda x: x["score"], reverse=True)
+
+def compute_stock_stats(df):
+    result = {}
+    for index_name in df["index_name"].unique():
+        sub = df[df["index_name"] == index_name].copy()
+        result[index_name] = compute_stats(sub, name_col="stock_name")
+    return result
+
+# ── HTML generation ───────────────────────────────────────────────────────────
+# We build the HTML as a regular string (not f-string) to avoid
+# conflicts between Python's {} and JavaScript's {} and ${}.
+def generate_html(index_stats, stock_stats, watchlist_stats, as_of):
+    index_json     = json.dumps(index_stats)
+    stock_json     = json.dumps(stock_stats)
+    watchlist_json = json.dumps(watchlist_stats)
+    watchlist_key  = json.dumps(WATCHLIST_KEY)
+
+    css = """
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=DM+Sans:wght@300;400;500;600&display=swap');
+:root {
+  --bg:#0d0f14; --surface:#13161d; --surface2:#1a1e28;
+  --border:rgba(255,255,255,0.07); --border2:rgba(255,255,255,0.13);
+  --text:#e8eaf0; --muted:#6b7280; --muted2:#9ca3af;
+  --green:#10b981; --red:#ef4444; --accent:#6366f1;
+  --mono:'IBM Plex Mono',monospace; --sans:'DM Sans',sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--sans);background:var(--bg);color:var(--text);font-size:13px}
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:14px 24px;
+  border-bottom:1px solid var(--border);background:var(--surface);flex-wrap:wrap;gap:10px}
+.brand{font-family:var(--mono);font-size:14px;font-weight:500;letter-spacing:0.03em}
+.asof{font-size:11px;color:var(--muted);font-family:var(--mono);margin-top:2px}
+.summary{display:flex;background:var(--surface);border-bottom:1px solid var(--border)}
+.sc{flex:1;padding:10px 16px;border-right:1px solid var(--border)}
+.sc:last-child{border-right:none}
+.sl{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.07em;font-family:var(--mono);margin-bottom:3px}
+.sv{font-size:16px;font-weight:500;font-family:var(--mono)}
+.pos{color:var(--green)} .neg{color:var(--red)} .neu{color:var(--muted2)}
+.filters{display:flex;gap:10px;padding:8px 24px;border-bottom:1px solid var(--border);
+  background:var(--surface);align-items:center;flex-wrap:wrap}
+.filters label{font-size:11px;color:var(--muted);font-family:var(--mono)}
+select{background:var(--surface2);color:var(--text);border:1px solid var(--border2);
+  border-radius:6px;padding:4px 8px;font-size:12px;font-family:var(--mono);cursor:pointer}
+input[type=text]{background:var(--surface2);color:var(--text);border:1px solid var(--border2);
+  border-radius:6px;padding:4px 10px;font-size:12px;font-family:var(--mono);width:160px;outline:none}
+input[type=text]:focus{border-color:var(--accent)}
+.notebar{padding:6px 24px;font-size:11px;color:var(--muted);background:var(--surface2);
+  border-bottom:1px solid var(--border);font-family:var(--mono)}
+.tbl-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;min-width:960px;font-size:11.5px}
+thead{position:sticky;top:0;z-index:5}
+th{padding:8px 8px;text-align:right;font-family:var(--mono);font-size:10px;font-weight:500;
+  color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;
+  border-bottom:1px solid var(--border2);background:var(--surface2);
+  white-space:nowrap;cursor:pointer;user-select:none}
+th:hover{color:var(--text)}
+th:first-child{text-align:left;position:sticky;left:0;z-index:6;background:var(--surface2);
+  min-width:160px;padding-left:20px}
+td{padding:6px 8px;text-align:right;border-bottom:1px solid var(--border);
+  white-space:nowrap;font-family:var(--mono)}
+td:first-child{text-align:left;position:sticky;left:0;background:var(--bg);z-index:2;
+  font-family:var(--sans);font-weight:500;padding-left:20px;font-size:12px}
+tr:hover td{background:var(--surface2)}
+tr:hover td:first-child{background:var(--surface2)}
+.mom{text-align:center;font-weight:500}
+.mp{color:var(--green)} .mn{color:var(--red)} .mz{color:#374151}
+.badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:10px;font-weight:500;font-family:var(--mono)}
+.bull{background:rgba(16,185,129,0.15);color:var(--green);border:1px solid rgba(16,185,129,0.25)}
+.bear{background:rgba(239,68,68,0.15);color:var(--red);border:1px solid rgba(239,68,68,0.25)}
+.ntrl{background:rgba(107,114,128,0.15);color:var(--muted2);border:1px solid rgba(107,114,128,0.2)}
+.cur{color:#c7d2fe;font-weight:500}
+.sa{color:var(--green);font-weight:600} .sn{color:var(--red);font-weight:600} .s0{color:var(--muted2)}
+.drill-panel{display:none;position:fixed;top:0;right:0;width:78vw;height:100vh;
+  background:var(--bg);border-left:1px solid var(--border2);z-index:1000;
+  flex-direction:column;box-shadow:-8px 0 40px rgba(0,0,0,0.6)}
+.drill-panel.open{display:flex}
+.drill-header{display:flex;align-items:center;justify-content:space-between;
+  padding:14px 20px;border-bottom:1px solid var(--border);background:var(--surface);flex-shrink:0}
+.drill-title{font-family:var(--mono);font-size:13px;font-weight:500}
+.drill-sub{font-size:11px;color:var(--muted);font-family:var(--mono);margin-top:2px}
+.drill-summary{display:flex;background:var(--surface);border-bottom:1px solid var(--border);flex-shrink:0}
+.close-btn{background:var(--surface2);border:1px solid var(--border2);color:var(--text);
+  border-radius:6px;padding:5px 14px;cursor:pointer;font-size:12px;font-family:var(--mono)}
+.close-btn:hover{background:var(--surface)}
+.drill-notebar{padding:5px 20px;font-size:11px;color:var(--muted);background:var(--surface2);
+  border-bottom:1px solid var(--border);font-family:var(--mono);flex-shrink:0}
+.drill-body{flex:1;overflow:auto}
+.no-data-msg{padding:40px;text-align:center;color:var(--muted);font-family:var(--mono);font-size:12px}
+.legend{display:flex;gap:16px;padding:10px 24px;border-top:1px solid var(--border);
+  background:var(--surface);font-size:11px;color:var(--muted);flex-wrap:wrap;align-items:center}
+.sort-asc::after{content:" ↑";color:var(--accent)}
+.sort-desc::after{content:" ↓";color:var(--accent)}
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:#2d3748;border-radius:3px}
+.watchlist-row td{background:rgba(99,102,241,0.07);border-bottom:1px solid rgba(99,102,241,0.2)}
+.watchlist-row:hover td{background:rgba(99,102,241,0.14)}
+.watchlist-row td:first-child{background:rgba(99,102,241,0.07)}
+.watchlist-row:hover td:first-child{background:rgba(99,102,241,0.14)}
+.watchlist-sep td{padding:0;height:3px;background:rgba(99,102,241,0.25);border:none}
+"""
+
+    js = """
+const INDEX_DATA    = """ + index_json + """;
+const STOCK_DATA    = """ + stock_json + """;
+const WATCHLIST     = """ + watchlist_json + """;
+const WATCHLIST_KEY = """ + watchlist_key + """;
+
+// Pre-assign momentum ranks (by score, descending)
+const ranked = [...INDEX_DATA].sort((a,b) => b.score - a.score);
+ranked.forEach((r,i) => { r.momRank = i+1; });
+for (const idxName in STOCK_DATA) {
+  const sr = [...STOCK_DATA[idxName]].sort((a,b) => b.score - a.score);
+  sr.forEach((r,i) => { r.momRank = i+1; });
+}
+if (WATCHLIST.length > 0) {
+  const wr = [...WATCHLIST].sort((a,b) => b.score - a.score);
+  wr.forEach((r,i) => { r.momRank = i+1; });
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+function fp(v)  { if(v==null||isNaN(v)) return '—'; return (v>=0?'+':'')+v.toFixed(2)+'%'; }
+function fpr(v) { if(!v) return '—'; return v.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2}); }
+function cc(v)  { if(v==null) return 'neu'; return v>0?'pos':v<0?'neg':'neu'; }
+function getMom(s) {
+  if(s>=7)  return {l:'↑↑ Strong Bull', c:'bull'};
+  if(s>=4)  return {l:'↑ Bull',         c:'bull'};
+  if(s<=-7) return {l:'↓↓ Strong Bear', c:'bear'};
+  if(s<=-4) return {l:'↓ Bear',         c:'bear'};
+  return {l:'→ Neutral', c:'ntrl'};
+}
+
+function momCell(v) {
+  const mc  = v===1?'mp':v===-1?'mn':'mz';
+  const lbl = v===1?'+1':v===-1?'−1':'0';
+  return '<td class="mom '+mc+'">'+lbl+'</td>';
+}
+
+function buildRows(data) {
+  let h = '';
+  data.forEach(r => {
+    const m  = getMom(r.score);
+    const sc = r.score>0?'sa':r.score<0?'sn':'s0';
+    h += '<tr>';
+    h += '<td>'+r.name+'</td>';
+    h += '<td class="cur">'+fpr(r.cur)+'</td>';
+    h += '<td class="'+cc(r.r1w)+'">'+fp(r.r1w)+'</td>';
+    h += '<td class="'+cc(r.r1m)+'">'+fp(r.r1m)+'</td>';
+    h += '<td class="'+cc(r.r3m)+'">'+fp(r.r3m)+'</td>';
+    h += '<td class="'+cc(r.r6m)+'">'+fp(r.r6m)+'</td>';
+    h += '<td class="'+cc(r.r1y)+'">'+fp(r.r1y)+'</td>';
+    r.mom.forEach(v => { h += momCell(v); });
+    h += '<td class="'+sc+'" style="text-align:center">'+(r.score>0?'+':'')+r.score+'</td>';
+    h += '<td style="text-align:center;color:var(--muted)">'+r.momRank+'</td>';
+    h += '<td style="text-align:center"><span class="badge '+m.c+'">'+m.l+'</span></td>';
+    h += '</tr>';
+  });
+  return h;
+}
+
+// ── INDEX TABLE ───────────────────────────────────────────────────────────────
+let sortKey='score', sortDir=-1;
+
+function getFiltered() {
+  const q  = document.getElementById('search').value.toLowerCase();
+  const mf = document.getElementById('momFilter').value;
+  return INDEX_DATA.filter(r => {
+    if(q && !r.name.toLowerCase().includes(q)) return false;
+    if(mf==='bull' && r.score<4)   return false;
+    if(mf==='bear' && r.score>-4)  return false;
+    if(mf==='ntrl' && (r.score>=4||r.score<=-4)) return false;
+    return true;
+  });
+}
+
+function renderTable() {
+  const filtered = getFiltered();
+  const sorted = [...filtered].sort((a,b) => {
+    const av = a[sortKey]??-Infinity, bv = b[sortKey]??-Infinity;
+    return typeof av==='string' ? sortDir*av.localeCompare(bv) : sortDir*(bv-av);
+  });
+
+  // ── Pinned watchlist row (always at top, not affected by sort/filter) ──────
+  let h = '';
+  if (WATCHLIST.length > 0) {
+    const ws  = WATCHLIST.reduce((a,b)=>b.score>a.score?b:a, WATCHLIST[0]);
+    const wsc = ws.score>0?'sa':ws.score<0?'sn':'s0';
+    const wm  = getMom(ws.score);   // aggregate: use best-score stock as proxy
+    // Compute watchlist-level aggregates for the row cells
+    const wCur  = null;   // no single "price" for a basket
+    const wR1w  = WATCHLIST.length ? (WATCHLIST.reduce((s,r)=>s+(r.r1w??0),0)/WATCHLIST.length) : null;
+    const wR1m  = WATCHLIST.length ? (WATCHLIST.reduce((s,r)=>s+(r.r1m??0),0)/WATCHLIST.length) : null;
+    const wR3m  = WATCHLIST.length ? (WATCHLIST.reduce((s,r)=>s+(r.r3m??0),0)/WATCHLIST.length) : null;
+    const wR6m  = WATCHLIST.length ? (WATCHLIST.reduce((s,r)=>s+(r.r6m??0),0)/WATCHLIST.length) : null;
+    const wR1y  = WATCHLIST.length ? (WATCHLIST.reduce((s,r)=>s+(r.r1y??0),0)/WATCHLIST.length) : null;
+    const avgScore = Math.round(WATCHLIST.reduce((s,r)=>s+r.score,0)/WATCHLIST.length);
+    const avgMom   = getMom(avgScore);
+    const avgSc    = avgScore>0?'sa':avgScore<0?'sn':'s0';
+    // Per-week average momentum signal
+    const avgMomArr = Array.from({length:10}, (_,i) =>
+      Math.round(WATCHLIST.reduce((s,r)=>s+(r.mom[i]??0),0)/WATCHLIST.length));
+
+    h += '<tr class="watchlist-row">';
+    h += '<td class="drill-link" data-index="__watchlist__" style="cursor:pointer;color:var(--accent);font-weight:600">'
+       + WATCHLIST_KEY + ' <span style="font-size:10px;opacity:0.7">&#x2197;</span>'
+       + ' <span style="font-size:10px;color:var(--muted);font-weight:400">('+WATCHLIST.length+' stocks, avg)</span></td>';
+    h += '<td class="cur" style="color:var(--muted)">—</td>';
+    h += '<td class="'+cc(wR1w)+'">'+fp(wR1w)+'</td>';
+    h += '<td class="'+cc(wR1m)+'">'+fp(wR1m)+'</td>';
+    h += '<td class="'+cc(wR3m)+'">'+fp(wR3m)+'</td>';
+    h += '<td class="'+cc(wR6m)+'">'+fp(wR6m)+'</td>';
+    h += '<td class="'+cc(wR1y)+'">'+fp(wR1y)+'</td>';
+    avgMomArr.forEach(v => { h += momCell(v); });
+    h += '<td class="'+avgSc+'" style="text-align:center">'+(avgScore>0?'+':'')+avgScore+'</td>';
+    h += '<td style="text-align:center;color:var(--muted)">—</td>';
+    h += '<td style="text-align:center"><span class="badge '+avgMom.c+'">'+avgMom.l+'</span></td>';
+    h += '</tr>';
+    h += '<tr class="watchlist-sep"><td colspan="20"></td></tr>';
+  }
+
+  sorted.forEach(r => {
+    const m  = getMom(r.score);
+    const sc = r.score>0?'sa':r.score<0?'sn':'s0';
+    const hasStocks = STOCK_DATA[r.name] && STOCK_DATA[r.name].length > 0;
+    h += '<tr>';
+    if(hasStocks) {
+      h += '<td class="drill-link" data-index="'+r.name+'" style="cursor:pointer;color:var(--accent)">'+r.name+' <span style="font-size:10px;opacity:0.6">&#x2197;</span></td>';
+    } else {
+      h += '<td>'+r.name+'</td>';
+    }
+    h += '<td class="cur">'+fpr(r.cur)+'</td>';
+    h += '<td class="'+cc(r.r1w)+'">'+fp(r.r1w)+'</td>';
+    h += '<td class="'+cc(r.r1m)+'">'+fp(r.r1m)+'</td>';
+    h += '<td class="'+cc(r.r3m)+'">'+fp(r.r3m)+'</td>';
+    h += '<td class="'+cc(r.r6m)+'">'+fp(r.r6m)+'</td>';
+    h += '<td class="'+cc(r.r1y)+'">'+fp(r.r1y)+'</td>';
+    r.mom.forEach(v => { h += momCell(v); });
+    h += '<td class="'+sc+'" style="text-align:center">'+(r.score>0?'+':'')+r.score+'</td>';
+    h += '<td style="text-align:center;color:var(--muted)">'+r.momRank+'</td>';
+    h += '<td style="text-align:center"><span class="badge '+m.c+'">'+m.l+'</span></td>';
+    h += '</tr>';
+  });
+  document.getElementById('tbody').innerHTML = h ||
+    '<tr><td colspan="20" style="text-align:center;padding:40px;color:var(--muted)">No indices match filter</td></tr>';
+
+  const bull = INDEX_DATA.filter(r=>r.score>=4).length;
+  const bear = INDEX_DATA.filter(r=>r.score<=-4).length;
+  document.getElementById('s-total').textContent = INDEX_DATA.length;
+  document.getElementById('s-bull').textContent  = bull;
+  document.getElementById('s-bear').textContent  = bear;
+  document.getElementById('s-neu').textContent   = INDEX_DATA.length-bull-bear;
+  const best  = INDEX_DATA.reduce((a,b)=>(b.r1w??-Infinity)>(a.r1w??-Infinity)?b:a, INDEX_DATA[0]);
+  const worst = INDEX_DATA.reduce((a,b)=>(b.r1w??Infinity)<(a.r1w??Infinity)?b:a, INDEX_DATA[0]);
+  document.getElementById('s-best').textContent  = best  ? best.name.split(' ').pop()+' '+fp(best.r1w)  : '—';
+  document.getElementById('s-worst').textContent = worst ? worst.name.split(' ').pop()+' '+fp(worst.r1w) : '—';
+}
+
+function sortBy(k) {
+  document.querySelectorAll('th[id^="sh-"]').forEach(t=>t.classList.remove('sort-asc','sort-desc'));
+  if(sortKey===k) sortDir*=-1; else { sortKey=k; sortDir=-1; }
+  const el = document.getElementById('sh-'+k);
+  if(el) el.classList.add(sortDir>0?'sort-asc':'sort-desc');
+  renderTable();
+}
+
+// ── DRILL-DOWN ────────────────────────────────────────────────────────────────
+let drillKey='score', drillDir=-1, currentIndex='';
+
+function openDrill(indexName) {
+  currentIndex = indexName;
+  drillKey = 'score'; drillDir = -1;
+
+  const isWatchlist = (indexName === '__watchlist__');
+  const stocks = isWatchlist ? WATCHLIST : STOCK_DATA[indexName];
+  const title  = isWatchlist ? WATCHLIST_KEY + ' — My Stocks' : indexName + ' — Constituent Stocks';
+
+  document.getElementById('drillTitle').textContent = title;
+  if(!stocks || stocks.length===0) {
+    document.getElementById('drillBody').innerHTML =
+      '<div class="no-data-msg">No stock data available for '+title+'.<br>Only indices with a defined constituent list support drill-down.</div>';
+  } else {
+    const bull = stocks.filter(r=>r.score>=4).length;
+    const bear = stocks.filter(r=>r.score<=-4).length;
+    document.getElementById('ds-total').textContent = stocks.length;
+    document.getElementById('ds-bull').textContent  = bull;
+    document.getElementById('ds-bear').textContent  = bear;
+    document.getElementById('ds-neu').textContent   = stocks.length-bull-bear;
+    const best  = stocks.reduce((a,b)=>(b.r1w??-Infinity)>(a.r1w??-Infinity)?b:a, stocks[0]);
+    const worst = stocks.reduce((a,b)=>(b.r1w??Infinity)<(a.r1w??Infinity)?b:a, stocks[0]);
+    document.getElementById('ds-best').textContent  = best  ? best.name+' '+fp(best.r1w)  : '—';
+    document.getElementById('ds-worst').textContent = worst ? worst.name+' '+fp(worst.r1w) : '—';
+    renderDrill();
+  }
+  document.getElementById('drillPanel').classList.add('open');
+  document.body.style.overflow = 'hidden';
+}
+
+function closeDrill() {
+  document.getElementById('drillPanel').classList.remove('open');
+  document.body.style.overflow = '';
+}
+
+function renderDrill() {
+  const stocks = (currentIndex === '__watchlist__') ? WATCHLIST : (STOCK_DATA[currentIndex] || []);
+  const sorted = [...stocks].sort((a,b) => {
+    const av = a[drillKey]??-Infinity, bv = b[drillKey]??-Infinity;
+    return typeof av==='string' ? drillDir*av.localeCompare(bv) : drillDir*(bv-av);
+  });
+  document.getElementById('drillBody').innerHTML = buildRows(sorted) ||
+    '<tr><td colspan="20" style="text-align:center;padding:40px;color:var(--muted)">No data</td></tr>';
+}
+
+function sortDrill(k) {
+  document.querySelectorAll('th[id^="dsh-"]').forEach(t=>t.classList.remove('sort-asc','sort-desc'));
+  if(drillKey===k) drillDir*=-1; else { drillKey=k; drillDir=-1; }
+  const el = document.getElementById('dsh-'+k);
+  if(el) el.classList.add(drillDir>0?'sort-asc':'sort-desc');
+  renderDrill();
+}
+
+document.addEventListener('keydown', e => { if(e.key==='Escape') closeDrill(); });
+document.getElementById('tbody').addEventListener('click', e => {
+  const td = e.target.closest('td.drill-link');
+  if(td) openDrill(td.dataset.index);
+});
+renderTable();
+"""
+
+    html = (
+        '<!DOCTYPE html>\n<html lang="en">\n<head>\n'
+        '<meta charset="UTF-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
+        '<title>NIFTY Dashboard \u2014 ' + as_of + '</title>\n'
+        '<style>' + css + '</style>\n'
+        '</head>\n<body>\n\n'
+
+        '<div class="topbar">\n'
+        '  <div>\n'
+        '    <div class="brand">NIFTY INDEX DASHBOARD</div>\n'
+        '    <div class="asof">As of ' + as_of + ' &nbsp;|&nbsp; Data: Yahoo Finance via yfinance &nbsp;|&nbsp; '
+        'Click any <span style="color:var(--accent)">index name \u2197</span> to see constituent stocks</div>\n'
+        '  </div>\n'
+        '  <div style="font-family:var(--mono);font-size:11px;color:var(--muted)">Run nifty_refresh.py every Friday after 5 PM IST</div>\n'
+        '</div>\n\n'
+
+        '<div class="summary">\n'
+        '  <div class="sc"><div class="sl">Indices</div><div class="sv" id="s-total">\u2014</div></div>\n'
+        '  <div class="sc"><div class="sl">Bull</div><div class="sv pos" id="s-bull">\u2014</div></div>\n'
+        '  <div class="sc"><div class="sl">Bear</div><div class="sv neg" id="s-bear">\u2014</div></div>\n'
+        '  <div class="sc"><div class="sl">Neutral</div><div class="sv neu" id="s-neu">\u2014</div></div>\n'
+        '  <div class="sc"><div class="sl">Best 1W</div><div class="sv pos" id="s-best">\u2014</div></div>\n'
+        '  <div class="sc"><div class="sl">Worst 1W</div><div class="sv neg" id="s-worst">\u2014</div></div>\n'
+        '</div>\n\n'
+
+        '<div class="filters">\n'
+        '  <label>Filter:</label>\n'
+        '  <input type="text" id="search" placeholder="Search index..." oninput="renderTable()">\n'
+        '  <label>Momentum:</label>\n'
+        '  <select id="momFilter" onchange="renderTable()">\n'
+        '    <option value="all">All</option>\n'
+        '    <option value="bull">Bull only</option>\n'
+        '    <option value="bear">Bear only</option>\n'
+        '    <option value="ntrl">Neutral only</option>\n'
+        '  </select>\n'
+        '</div>\n\n'
+
+        '<div class="notebar">Weekly closes (Friday) &nbsp;|&nbsp; Momentum = +1/\u22121 per week over 10 weeks'
+        ' &nbsp;|&nbsp; Score = sum &nbsp;|&nbsp; Bull \u2265 +4 &nbsp;|&nbsp; Bear \u2264 \u22124'
+        ' &nbsp;|&nbsp; Click <span style="color:var(--accent)">index name</span> to drill into stocks</div>\n\n'
+
+        '<div class="tbl-wrap">\n'
+        '<table>\n<thead>\n<tr>\n'
+        '  <th onclick="sortBy(\'name\')" id="sh-name">Index</th>\n'
+        '  <th onclick="sortBy(\'cur\')">Current</th>\n'
+        '  <th onclick="sortBy(\'r1w\')" id="sh-r1w" class="sort-desc">1W %</th>\n'
+        '  <th onclick="sortBy(\'r1m\')" id="sh-r1m">1M %</th>\n'
+        '  <th onclick="sortBy(\'r3m\')" id="sh-r3m">3M %</th>\n'
+        '  <th onclick="sortBy(\'r6m\')" id="sh-r6m">6M %</th>\n'
+        '  <th onclick="sortBy(\'r1y\')" id="sh-r1y">1Y %</th>\n'
+        '  <th>W10</th><th>W9</th><th>W8</th><th>W7</th><th>W6</th>\n'
+        '  <th>W5</th><th>W4</th><th>W3</th><th>W2</th><th>W1</th>\n'
+        '  <th onclick="sortBy(\'score\')" id="sh-score">Score</th>\n'
+        '  <th>Rank</th>\n'
+        '  <th>Momentum</th>\n'
+        '</tr>\n</thead>\n'
+        '<tbody id="tbody"></tbody>\n'
+        '</table>\n</div>\n\n'
+
+        '<div class="legend">\n'
+        '  <span class="pos">+ green = positive</span>\n'
+        '  <span class="neg">- red = negative</span>\n'
+        '  <span><span class="badge bull">Bull</span> \u2265 +4</span>\n'
+        '  <span><span class="badge ntrl">Neutral</span> \u22123 to +3</span>\n'
+        '  <span><span class="badge bear">Bear</span> \u2264 \u22124</span>\n'
+        '  <span style="margin-left:auto;color:var(--muted);font-family:var(--mono);font-size:11px">'
+        'Click <span style="color:var(--accent)">index name \u2197</span> \u2192 stock drill-down &nbsp;|&nbsp; Click column header \u2192 sort</span>\n'
+        '</div>\n\n'
+
+        '<!-- DRILL-DOWN PANEL -->\n'
+        '<div class="drill-panel" id="drillPanel">\n'
+        '  <div class="drill-header">\n'
+        '    <div>\n'
+        '      <div class="drill-title" id="drillTitle">\u2014</div>\n'
+        '      <div class="drill-sub">Constituent stocks \u2014 same momentum metrics as index view</div>\n'
+        '    </div>\n'
+        '    <button class="close-btn" onclick="closeDrill()">\u2715 Close &nbsp;(Esc)</button>\n'
+        '  </div>\n'
+        '  <div class="drill-summary">\n'
+        '    <div class="sc"><div class="sl">Stocks</div><div class="sv" id="ds-total">\u2014</div></div>\n'
+        '    <div class="sc"><div class="sl">Bull</div><div class="sv pos" id="ds-bull">\u2014</div></div>\n'
+        '    <div class="sc"><div class="sl">Bear</div><div class="sv neg" id="ds-bear">\u2014</div></div>\n'
+        '    <div class="sc"><div class="sl">Neutral</div><div class="sv neu" id="ds-neu">\u2014</div></div>\n'
+        '    <div class="sc"><div class="sl">Best 1W</div><div class="sv pos" id="ds-best">\u2014</div></div>\n'
+        '    <div class="sc"><div class="sl">Worst 1W</div><div class="sv neg" id="ds-worst">\u2014</div></div>\n'
+        '  </div>\n'
+        '  <div class="drill-notebar">Sorted by momentum score (highest first) \u2014 click headers to re-sort \u2014 press Esc to close</div>\n'
+        '  <div class="drill-body">\n'
+        '    <div class="tbl-wrap">\n'
+        '    <table id="drillTable">\n<thead>\n<tr>\n'
+        '      <th onclick="sortDrill(\'name\')" id="dsh-name">Stock</th>\n'
+        '      <th onclick="sortDrill(\'cur\')">Price (\u20b9)</th>\n'
+        '      <th onclick="sortDrill(\'r1w\')" id="dsh-r1w" class="sort-desc">1W %</th>\n'
+        '      <th onclick="sortDrill(\'r1m\')" id="dsh-r1m">1M %</th>\n'
+        '      <th onclick="sortDrill(\'r3m\')" id="dsh-r3m">3M %</th>\n'
+        '      <th onclick="sortDrill(\'r6m\')" id="dsh-r6m">6M %</th>\n'
+        '      <th onclick="sortDrill(\'r1y\')" id="dsh-r1y">1Y %</th>\n'
+        '      <th>W10</th><th>W9</th><th>W8</th><th>W7</th><th>W6</th>\n'
+        '      <th>W5</th><th>W4</th><th>W3</th><th>W2</th><th>W1</th>\n'
+        '      <th onclick="sortDrill(\'score\')" id="dsh-score">Score</th>\n'
+        '      <th>Rank</th>\n'
+        '      <th>Momentum</th>\n'
+        '    </tr>\n</thead>\n'
+        '    <tbody id="drillBody"></tbody>\n'
+        '    </table>\n    </div>\n  </div>\n</div>\n\n'
+        '<script>\n' + js + '\n</script>\n'
+        '</body>\n</html>'
+    )
+    return html
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    print("=" * 62)
+    print("  NIFTY Index Dashboard — Weekly Refresh")
+    print(f"  {datetime.now().strftime('%A, %d %b %Y  %I:%M %p')}")
+    print("=" * 62)
+
+    print("\n[1/4] Fetching NIFTY index data...\n")
+    idx_df = fetch_indices()
+    if idx_df.empty:
+        print("No index data fetched. Check internet connection.")
+        sys.exit(1)
+    idx_df.to_csv(CSV_INDEX_PATH, index=False)
+    print(f"\n  Saved \u2192 {CSV_INDEX_PATH}")
+
+    print("\n[2/4] Fetching constituent stock data...")
+    stk_df = fetch_stocks()
+    if not stk_df.empty:
+        stk_df.to_csv(CSV_STOCKS_PATH, index=False)
+        print(f"\n  Saved \u2192 {CSV_STOCKS_PATH}")
+
+    wl_tickers = load_watchlist()
+    wl_df      = pd.DataFrame()
+    if wl_tickers:
+        print(f"\n[2b] Fetching watchlist ({len(wl_tickers)} stocks from stocks.txt)...")
+        wl_df = fetch_watchlist(wl_tickers)
+        if not wl_df.empty:
+            wl_df.to_csv(CSV_WATCHLIST_PATH, index=False)
+            print(f"\n  Saved \u2192 {CSV_WATCHLIST_PATH}")
+    else:
+        print("\n[2b] No stocks.txt found (or empty) — skipping watchlist.")
+        print(f"       Create {WATCHLIST_FILE} with one ticker per line to enable this feature.")
+
+    print("\n[3/4] Computing returns and momentum signals...")
+    index_stats = compute_stats(idx_df, name_col="index_name")
+    print(f"  {len(index_stats)} indices ready")
+    stock_stats = {}
+    if not stk_df.empty:
+        stock_stats = compute_stock_stats(stk_df)
+        total_stks = sum(len(v) for v in stock_stats.values())
+        print(f"  {total_stks} stocks across {len(stock_stats)} indices ready")
+    watchlist_stats = []
+    if not wl_df.empty:
+        watchlist_stats = compute_stats(wl_df, name_col="stock_name")
+        print(f"  {len(watchlist_stats)} watchlist stocks ready")
+
+    print("\n[4/4] Generating dashboard HTML...")
+    as_of = datetime.now().strftime("%d %b %Y, %I:%M %p IST")
+    html  = generate_html(index_stats, stock_stats, watchlist_stats, as_of)
+    with open(HTML_PATH, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"  Saved \u2192 {HTML_PATH}")
+
+    # webbrowser.open(f"file://{HTML_PATH}")
+    print("\nDone! Click any index name (in accent colour \u2197) to see its constituent stocks.")
+    print("Run again next Friday after 5 PM IST.")
+    print("=" * 62)
+
+if __name__ == "__main__":
+    main()

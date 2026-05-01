@@ -1,0 +1,9 @@
+# My Watchlist — one ticker per line
+# Lines starting with # are ignored
+# .NS is added automatically if not present
+# You can use NSE tickers directly (no exchange suffix needed)
+
+PRECWIRE
+MODISONLTD
+DIXON
+PIRAMALFIN
