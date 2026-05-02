@@ -166,8 +166,11 @@ def fetch_weekly(ticker):
     closes = col.dropna()
     rows = []
     for dt, close in closes.items():
+        val = float(close)
+        if val <= 0:          # skip zero / bad candles
+            continue
         date_str = dt.strftime("%Y-%m-%d") if hasattr(dt, "strftime") else str(dt)[:10]
-        rows.append({"date": date_str, "close": round(float(close), 2)})
+        rows.append({"date": date_str, "close": round(val, 2)})
     return rows
 
 # ── Fetch all indices ─────────────────────────────────────────────────────────
@@ -254,25 +257,61 @@ def compute_stats(df, name_col="index_name"):
     results = []
     for name, group in df.groupby(name_col, sort=False):
         g = group.sort_values("date").reset_index(drop=True)
+        # Drop any rows where close is 0 or NaN (incomplete candles)
+        g = g[g["close"].notna() & (g["close"] > 0)].reset_index(drop=True)
         closes = g["close"].tolist()
+        dts    = g["date"].tolist()
         n = len(closes)
         if n < 3:
             continue
-        cur = closes[-1]
-        w   = lambda k: closes[-1-k] if n > k else None
-        pct = lambda a, b: round(((a-b)/b)*100, 2) if a and b and b != 0 else None
-        r1w = pct(cur, w(1)); r1m = pct(cur, w(4))
-        r3m = pct(cur, w(13)); r6m = pct(cur, w(26))
-        r1y = pct(cur, closes[0])
+
+        cur    = closes[-1]
+        cur_dt = dts[-1]
+
+        def w(k):
+            idx = n - 1 - k
+            return closes[idx] if idx >= 0 else None
+
+        def wd(k):
+            idx = n - 1 - k
+            return dts[idx] if idx >= 0 else None
+
+        def pct(a, b):
+            if a is None or b is None or b == 0:
+                return None
+            return round(((a - b) / b) * 100, 2)
+
+        # Period returns: 1W 2W 3W 4W 5W 6W 6M 1Y
+        r1w = pct(cur, w(1));  r2w = pct(cur, w(2))
+        r3w = pct(cur, w(3));  r4w = pct(cur, w(4))
+        r5w = pct(cur, w(5));  r6w = pct(cur, w(6))
+        r6m = pct(cur, w(26)); r1y = pct(cur, closes[0])
+
+        # Closing values at each period baseline
+        c1w = w(1);  c2w = w(2);  c3w = w(3);  c4w = w(4)
+        c5w = w(5);  c6w = w(6);  c6m = w(26); c1y = closes[0]
+
+        # Dates of each period baseline
+        d1w = wd(1);  d2w = wd(2);  d3w = wd(3);  d4w = wd(4)
+        d5w = wd(5);  d6w = wd(6);  d6m = wd(26); d1y = dts[0]
+
         mom = []
         for k in range(10, 0, -1):
             a, b = w(k-1), w(k)
-            if a is None or b is None: mom.append(0)
-            else: mom.append(1 if a > b else (-1 if a < b else 0))
+            if a is None or b is None:
+                mom.append(0)
+            else:
+                mom.append(1 if a > b else (-1 if a < b else 0))
         score = sum(mom)
+
         results.append({
-            "name": name, "cur": cur,
-            "r1w": r1w, "r1m": r1m, "r3m": r3m, "r6m": r6m, "r1y": r1y,
+            "name": name, "cur": cur, "cur_dt": cur_dt,
+            "r1w": r1w,  "r2w": r2w,  "r3w": r3w,  "r4w": r4w,
+            "r5w": r5w,  "r6w": r6w,  "r6m": r6m,  "r1y": r1y,
+            "c1w": c1w,  "c2w": c2w,  "c3w": c3w,  "c4w": c4w,
+            "c5w": c5w,  "c6w": c6w,  "c6m": c6m,  "c1y": c1y,
+            "d1w": d1w,  "d2w": d2w,  "d3w": d3w,  "d4w": d4w,
+            "d5w": d5w,  "d6w": d6w,  "d6m": d6m,  "d1y": d1y,
             "mom": mom, "score": score,
         })
     return sorted(results, key=lambda x: x["score"], reverse=True)
@@ -371,6 +410,9 @@ tr:hover td:first-child{background:var(--surface2)}
 ::-webkit-scrollbar{width:5px;height:5px}
 ::-webkit-scrollbar-track{background:var(--bg)}
 ::-webkit-scrollbar-thumb{background:#2d3748;border-radius:3px}
+.hdr-date{font-size:9px;color:var(--muted);font-weight:400;letter-spacing:0;text-transform:none;display:block;margin-top:1px}
+th{line-height:1.25}
+td{padding:5px 8px;vertical-align:top}
 .watchlist-row td{background:rgba(99,102,241,0.07);border-bottom:1px solid rgba(99,102,241,0.2)}
 .watchlist-row:hover td{background:rgba(99,102,241,0.14)}
 .watchlist-row td:first-child{background:rgba(99,102,241,0.07)}
@@ -398,8 +440,15 @@ if (WATCHLIST.length > 0) {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 function fp(v)  { if(v==null||isNaN(v)) return '—'; return (v>=0?'+':'')+v.toFixed(2)+'%'; }
-function fpr(v) { if(!v) return '—'; return v.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2}); }
+function fpr(v) { if(v==null||v===undefined) return '—'; return v.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2}); }
 function cc(v)  { if(v==null) return 'neu'; return v>0?'pos':v<0?'neg':'neu'; }
+function fmtDate(d) {
+  if(!d) return '';
+  const dt = new Date(d);
+  const day = dt.toLocaleDateString('en-IN',{day:'2-digit',month:'short'});
+  const yr  = String(dt.getFullYear()).slice(-2);
+  return day + ' ' + yr;
+}
 function getMom(s) {
   if(s>=7)  return {l:'↑↑ Strong Bull', c:'bull'};
   if(s>=4)  return {l:'↑ Bull',         c:'bull'};
@@ -414,6 +463,16 @@ function momCell(v) {
   return '<td class="mom '+mc+'">'+lbl+'</td>';
 }
 
+// Period cell: shows % on top, closing value below
+function pCell(pct, close, cls) {
+  const pStr = fp(pct);
+  const cStr = fpr(close);
+  return '<td class="'+cls+'" style="line-height:1.3">'
+    + '<div>'+pStr+'</div>'
+    + '<div style="font-size:10px;color:var(--muted2);font-weight:400">'+cStr+'</div>'
+    + '</td>';
+}
+
 function buildRows(data) {
   let h = '';
   data.forEach(r => {
@@ -422,11 +481,14 @@ function buildRows(data) {
     h += '<tr>';
     h += '<td>'+r.name+'</td>';
     h += '<td class="cur">'+fpr(r.cur)+'</td>';
-    h += '<td class="'+cc(r.r1w)+'">'+fp(r.r1w)+'</td>';
-    h += '<td class="'+cc(r.r1m)+'">'+fp(r.r1m)+'</td>';
-    h += '<td class="'+cc(r.r3m)+'">'+fp(r.r3m)+'</td>';
-    h += '<td class="'+cc(r.r6m)+'">'+fp(r.r6m)+'</td>';
-    h += '<td class="'+cc(r.r1y)+'">'+fp(r.r1y)+'</td>';
+    h += pCell(r.r1w, r.c1w, cc(r.r1w));
+    h += pCell(r.r2w, r.c2w, cc(r.r2w));
+    h += pCell(r.r3w, r.c3w, cc(r.r3w));
+    h += pCell(r.r4w, r.c4w, cc(r.r4w));
+    h += pCell(r.r5w, r.c5w, cc(r.r5w));
+    h += pCell(r.r6w, r.c6w, cc(r.r6w));
+    h += pCell(r.r6m, r.c6m, cc(r.r6m));
+    h += pCell(r.r1y, r.c1y, cc(r.r1y));
     r.mom.forEach(v => { h += momCell(v); });
     h += '<td class="'+sc+'" style="text-align:center">'+(r.score>0?'+':'')+r.score+'</td>';
     h += '<td style="text-align:center;color:var(--muted)">'+r.momRank+'</td>';
@@ -467,8 +529,6 @@ function renderTable() {
     // Compute watchlist-level aggregates for the row cells
     const wCur  = null;   // no single "price" for a basket
     const wR1w  = WATCHLIST.length ? (WATCHLIST.reduce((s,r)=>s+(r.r1w??0),0)/WATCHLIST.length) : null;
-    const wR1m  = WATCHLIST.length ? (WATCHLIST.reduce((s,r)=>s+(r.r1m??0),0)/WATCHLIST.length) : null;
-    const wR3m  = WATCHLIST.length ? (WATCHLIST.reduce((s,r)=>s+(r.r3m??0),0)/WATCHLIST.length) : null;
     const wR6m  = WATCHLIST.length ? (WATCHLIST.reduce((s,r)=>s+(r.r6m??0),0)/WATCHLIST.length) : null;
     const wR1y  = WATCHLIST.length ? (WATCHLIST.reduce((s,r)=>s+(r.r1y??0),0)/WATCHLIST.length) : null;
     const avgScore = Math.round(WATCHLIST.reduce((s,r)=>s+r.score,0)/WATCHLIST.length);
@@ -483,9 +543,17 @@ function renderTable() {
        + WATCHLIST_KEY + ' <span style="font-size:10px;opacity:0.7">&#x2197;</span>'
        + ' <span style="font-size:10px;color:var(--muted);font-weight:400">('+WATCHLIST.length+' stocks, avg)</span></td>';
     h += '<td class="cur" style="color:var(--muted)">—</td>';
+    const wR2w = WATCHLIST.length ? (WATCHLIST.reduce((s,r)=>s+(r.r2w??0),0)/WATCHLIST.length) : null;
+    const wR3w = WATCHLIST.length ? (WATCHLIST.reduce((s,r)=>s+(r.r3w??0),0)/WATCHLIST.length) : null;
+    const wR4w = WATCHLIST.length ? (WATCHLIST.reduce((s,r)=>s+(r.r4w??0),0)/WATCHLIST.length) : null;
+    const wR5w = WATCHLIST.length ? (WATCHLIST.reduce((s,r)=>s+(r.r5w??0),0)/WATCHLIST.length) : null;
+    const wR6w = WATCHLIST.length ? (WATCHLIST.reduce((s,r)=>s+(r.r6w??0),0)/WATCHLIST.length) : null;
     h += '<td class="'+cc(wR1w)+'">'+fp(wR1w)+'</td>';
-    h += '<td class="'+cc(wR1m)+'">'+fp(wR1m)+'</td>';
-    h += '<td class="'+cc(wR3m)+'">'+fp(wR3m)+'</td>';
+    h += '<td class="'+cc(wR2w)+'">'+fp(wR2w)+'</td>';
+    h += '<td class="'+cc(wR3w)+'">'+fp(wR3w)+'</td>';
+    h += '<td class="'+cc(wR4w)+'">'+fp(wR4w)+'</td>';
+    h += '<td class="'+cc(wR5w)+'">'+fp(wR5w)+'</td>';
+    h += '<td class="'+cc(wR6w)+'">'+fp(wR6w)+'</td>';
     h += '<td class="'+cc(wR6m)+'">'+fp(wR6m)+'</td>';
     h += '<td class="'+cc(wR1y)+'">'+fp(wR1y)+'</td>';
     avgMomArr.forEach(v => { h += momCell(v); });
@@ -507,11 +575,14 @@ function renderTable() {
       h += '<td>'+r.name+'</td>';
     }
     h += '<td class="cur">'+fpr(r.cur)+'</td>';
-    h += '<td class="'+cc(r.r1w)+'">'+fp(r.r1w)+'</td>';
-    h += '<td class="'+cc(r.r1m)+'">'+fp(r.r1m)+'</td>';
-    h += '<td class="'+cc(r.r3m)+'">'+fp(r.r3m)+'</td>';
-    h += '<td class="'+cc(r.r6m)+'">'+fp(r.r6m)+'</td>';
-    h += '<td class="'+cc(r.r1y)+'">'+fp(r.r1y)+'</td>';
+    h += pCell(r.r1w, r.c1w, cc(r.r1w));
+    h += pCell(r.r2w, r.c2w, cc(r.r2w));
+    h += pCell(r.r3w, r.c3w, cc(r.r3w));
+    h += pCell(r.r4w, r.c4w, cc(r.r4w));
+    h += pCell(r.r5w, r.c5w, cc(r.r5w));
+    h += pCell(r.r6w, r.c6w, cc(r.r6w));
+    h += pCell(r.r6m, r.c6m, cc(r.r6m));
+    h += pCell(r.r1y, r.c1y, cc(r.r1y));
     r.mom.forEach(v => { h += momCell(v); });
     h += '<td class="'+sc+'" style="text-align:center">'+(r.score>0?'+':'')+r.score+'</td>';
     h += '<td style="text-align:center;color:var(--muted)">'+r.momRank+'</td>';
@@ -569,6 +640,7 @@ function openDrill(indexName) {
     document.getElementById('ds-worst').textContent = worst ? worst.name+' '+fp(worst.r1w) : '—';
     renderDrill();
   }
+  fillHeaderDates(stocks, 'dhd-');
   document.getElementById('drillPanel').classList.add('open');
   document.body.style.overflow = 'hidden';
 }
@@ -601,6 +673,24 @@ document.getElementById('tbody').addEventListener('click', e => {
   const td = e.target.closest('td.drill-link');
   if(td) openDrill(td.dataset.index);
 });
+
+// Fill period header dates from first data row
+function fillHeaderDates(data, prefix) {
+  if(!data || !data.length) return;
+  const r = data[0];
+  const map = {
+    'cur': r.cur_dt,
+    '1w': r.d1w, '2w': r.d2w, '3w': r.d3w,
+    '4w': r.d4w, '5w': r.d5w, '6w': r.d6w,
+    '6m': r.d6m, '1y': r.d1y
+  };
+  for(const [key, val] of Object.entries(map)) {
+    const el = document.getElementById(prefix + key);
+    if(el && val) el.textContent = fmtDate(val);
+  }
+}
+fillHeaderDates(INDEX_DATA, 'hd-');
+
 renderTable();
 """
 
@@ -649,12 +739,15 @@ renderTable();
         '<div class="tbl-wrap">\n'
         '<table>\n<thead>\n<tr>\n'
         '  <th onclick="sortBy(\'name\')" id="sh-name">Index</th>\n'
-        '  <th onclick="sortBy(\'cur\')">Current</th>\n'
-        '  <th onclick="sortBy(\'r1w\')" id="sh-r1w" class="sort-desc">1W %</th>\n'
-        '  <th onclick="sortBy(\'r1m\')" id="sh-r1m">1M %</th>\n'
-        '  <th onclick="sortBy(\'r3m\')" id="sh-r3m">3M %</th>\n'
-        '  <th onclick="sortBy(\'r6m\')" id="sh-r6m">6M %</th>\n'
-        '  <th onclick="sortBy(\'r1y\')" id="sh-r1y">1Y %</th>\n'
+        '  <th onclick="sortBy(\'cur\')">Current<br><span class="hdr-date" id="hd-cur"></span></th>\n'
+        '  <th onclick="sortBy(\'r1w\')" id="sh-r1w" class="sort-desc">1W %<br><span class="hdr-date" id="hd-1w"></span></th>\n'
+        '  <th onclick="sortBy(\'r2w\')" id="sh-r2w">2W %<br><span class="hdr-date" id="hd-2w"></span></th>\n'
+        '  <th onclick="sortBy(\'r3w\')" id="sh-r3w">3W %<br><span class="hdr-date" id="hd-3w"></span></th>\n'
+        '  <th onclick="sortBy(\'r4w\')" id="sh-r4w">4W %<br><span class="hdr-date" id="hd-4w"></span></th>\n'
+        '  <th onclick="sortBy(\'r5w\')" id="sh-r5w">5W %<br><span class="hdr-date" id="hd-5w"></span></th>\n'
+        '  <th onclick="sortBy(\'r6w\')" id="sh-r6w">6W %<br><span class="hdr-date" id="hd-6w"></span></th>\n'
+        '  <th onclick="sortBy(\'r6m\')" id="sh-r6m">6M %<br><span class="hdr-date" id="hd-6m"></span></th>\n'
+        '  <th onclick="sortBy(\'r1y\')" id="sh-r1y">1Y %<br><span class="hdr-date" id="hd-1y"></span></th>\n'
         '  <th>W10</th><th>W9</th><th>W8</th><th>W7</th><th>W6</th>\n'
         '  <th>W5</th><th>W4</th><th>W3</th><th>W2</th><th>W1</th>\n'
         '  <th onclick="sortBy(\'score\')" id="sh-score">Score</th>\n'
@@ -696,12 +789,15 @@ renderTable();
         '    <div class="tbl-wrap">\n'
         '    <table id="drillTable">\n<thead>\n<tr>\n'
         '      <th onclick="sortDrill(\'name\')" id="dsh-name">Stock</th>\n'
-        '      <th onclick="sortDrill(\'cur\')">Price (\u20b9)</th>\n'
-        '      <th onclick="sortDrill(\'r1w\')" id="dsh-r1w" class="sort-desc">1W %</th>\n'
-        '      <th onclick="sortDrill(\'r1m\')" id="dsh-r1m">1M %</th>\n'
-        '      <th onclick="sortDrill(\'r3m\')" id="dsh-r3m">3M %</th>\n'
-        '      <th onclick="sortDrill(\'r6m\')" id="dsh-r6m">6M %</th>\n'
-        '      <th onclick="sortDrill(\'r1y\')" id="dsh-r1y">1Y %</th>\n'
+        '      <th onclick="sortDrill(\'cur\')">Price (\u20b9)<br><span class="hdr-date" id="dhd-cur"></span></th>\n'
+        '      <th onclick="sortDrill(\'r1w\')" id="dsh-r1w" class="sort-desc">1W %<br><span class="hdr-date" id="dhd-1w"></span></th>\n'
+        '      <th onclick="sortDrill(\'r2w\')" id="dsh-r2w">2W %<br><span class="hdr-date" id="dhd-2w"></span></th>\n'
+        '      <th onclick="sortDrill(\'r3w\')" id="dsh-r3w">3W %<br><span class="hdr-date" id="dhd-3w"></span></th>\n'
+        '      <th onclick="sortDrill(\'r4w\')" id="dsh-r4w">4W %<br><span class="hdr-date" id="dhd-4w"></span></th>\n'
+        '      <th onclick="sortDrill(\'r5w\')" id="dsh-r5w">5W %<br><span class="hdr-date" id="dhd-5w"></span></th>\n'
+        '      <th onclick="sortDrill(\'r6w\')" id="dsh-r6w">6W %<br><span class="hdr-date" id="dhd-6w"></span></th>\n'
+        '      <th onclick="sortDrill(\'r6m\')" id="dsh-r6m">6M %<br><span class="hdr-date" id="dhd-6m"></span></th>\n'
+        '      <th onclick="sortDrill(\'r1y\')" id="dsh-r1y">1Y %<br><span class="hdr-date" id="dhd-1y"></span></th>\n'
         '      <th>W10</th><th>W9</th><th>W8</th><th>W7</th><th>W6</th>\n'
         '      <th>W5</th><th>W4</th><th>W3</th><th>W2</th><th>W1</th>\n'
         '      <th onclick="sortDrill(\'score\')" id="dsh-score">Score</th>\n'
