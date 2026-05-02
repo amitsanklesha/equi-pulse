@@ -150,7 +150,7 @@ CSV_WATCHLIST_PATH = os.path.join(SCRIPT_DIR, "nifty_watchlist_data.csv")
 HTML_PATH              = os.path.join(SCRIPT_DIR, "index.html")
 LOOKUP_SERVER_PATH     = os.path.join(SCRIPT_DIR, "lookup_server.py")
 NETLIFY_FUNC_DIR       = os.path.join(SCRIPT_DIR, "netlify", "functions")
-NETLIFY_FUNC_PATH      = os.path.join(NETLIFY_FUNC_DIR, "lookup.mjs")
+NETLIFY_FUNC_PATH      = os.path.join(NETLIFY_FUNC_DIR, "lookup.js")
 NETLIFY_TOML_PATH      = os.path.join(SCRIPT_DIR, "netlify.toml")
 PACKAGE_JSON_PATH      = os.path.join(SCRIPT_DIR, "package.json")
 WATCHLIST_FILE         = os.path.join(SCRIPT_DIR, "stocks.txt")
@@ -330,9 +330,9 @@ def compute_stock_stats(df):
 
 # ── Lookup infrastructure writers ────────────────────────────────────────────
 def write_netlify_function():
-    """Write netlify/functions/lookup.mjs — the serverless lookup endpoint."""
+    """Write netlify/functions/lookup.js — the serverless lookup endpoint."""
     os.makedirs(NETLIFY_FUNC_DIR, exist_ok=True)
-    code = r"""// netlify/functions/lookup.mjs
+    code = r"""// netlify/functions/lookup.js
 // Netlify serverless function — called by the dashboard when hosted on Netlify.
 // Fetches 1-year weekly closes from Yahoo Finance and computes the same stats
 // as the Python nifty_refresh.py script.
@@ -446,10 +446,10 @@ def write_netlify_toml():
     toml = """\
 [build]
   publish = "."
-  functions = "netlify/functions"
 
 [functions]
-  node_bundler = "zisi"
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
 """
     with open(NETLIFY_TOML_PATH, "w", encoding="utf-8") as f:
         f.write(toml)
@@ -466,6 +466,7 @@ def write_package_json():
   "name": "equipulse",
   "version": "1.0.0",
   "description": "NIFTY Index Dashboard",
+  "type": "module",
   "dependencies": {
     "yahoo-finance2": "^2.11.3"
   }

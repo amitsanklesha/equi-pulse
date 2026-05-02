@@ -2,6 +2,7 @@
   "name": "equipulse",
   "version": "1.0.0",
   "description": "NIFTY Index Dashboard",
+  "type": "module",
   "dependencies": {
     "yahoo-finance2": "^2.11.3"
   }

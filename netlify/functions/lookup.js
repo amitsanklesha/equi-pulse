@@ -1,4 +1,4 @@
-// netlify/functions/lookup.mjs
+// netlify/functions/lookup.js
 // Netlify serverless function — called by the dashboard when hosted on Netlify.
 // Fetches 1-year weekly closes from Yahoo Finance and computes the same stats
 // as the Python nifty_refresh.py script.
