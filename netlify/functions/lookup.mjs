@@ -1,4 +1,4 @@
-// netlify/functions/lookup.js
+// netlify/functions/lookup.mjs
 // Netlify serverless function — called by the dashboard when hosted on Netlify.
 // Fetches 1-year weekly closes from Yahoo Finance and computes the same stats
 // as the Python nifty_refresh.py script.
@@ -6,9 +6,9 @@
 // Deploy: just push to your Netlify-linked repo. No config needed.
 // Dependency: yahoo-finance2  (listed in package.json at repo root)
 
-const yahooFinance = require("yahoo-finance2").default;
+import yahooFinance from "yahoo-finance2";
 
-exports.handler = async (event) => {
+export const handler = async (event) => {
   const headers = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, OPTIONS",
