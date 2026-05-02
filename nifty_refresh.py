@@ -33,10 +33,10 @@ INDICES = [
     ("Nifty Next 50",      "^NSMIDCP"),
     ("Nifty 100",          "^CNX100"),
     ("Nifty 200",          "^CNX200"),
-    ("Nifty 500",          "^CNX500"),
+    ("Nifty 500",          "^CRSLDX"),
     ("Nifty Midcap 50",    "^NSEMDCP50"),
     ("Nifty Midcap 100",   "NIFTY_MIDCAP_100.NS"),
-    ("Nifty Smallcap 100", "NIFTYSMLCAP100.NS"),
+    ("Nifty Smallcap 100", "^CNXSC"),
     ("Nifty Smallcap 250", "NIFTYSMLCAP250.NS"),
     ("Nifty Bank",         "^NSEBANK"),
     ("Nifty IT",           "^CNXIT"),
@@ -55,9 +55,9 @@ INDICES = [
     ("Nifty Commodities",  "^CNXCMDT"),
     ("Nifty Services",     "^CNXSERVICE"),
     ("Nifty MNC",          "^CNXMNC"),
-    ("Nifty CPSE",         "NIFTYCPSE.NS"),
-    ("Nifty Healthcare",   "NIFTYHEALTHCARE.NS"),
-    ("Nifty India Mfg",    "NIFTYINDIAMFG.NS"),
+    ("Nifty CPSE",         "NIFTY_CPSE.NS"),
+    ("Nifty Healthcare",   "NIFTY_HEALTHCARE.NS"),
+    ("Nifty India Mfg",    "NIFTY_INDIA_MFG.NS"),
 ]
 
 # ── Constituent stocks per index (Yahoo Finance .NS tickers) ──────────────────
@@ -69,7 +69,7 @@ CONSTITUENTS = {
         "EICHERMOT.NS","GRASIM.NS","HCLTECH.NS","HDFCBANK.NS","HDFCLIFE.NS",
         "HEROMOTOCO.NS","HINDALCO.NS","HINDUNILVR.NS","ICICIBANK.NS","ITC.NS",
         "INDUSINDBK.NS","INFY.NS","JSWSTEEL.NS","KOTAKBANK.NS","LT.NS",
-        "LTIMIND.NS","M&M.NS","MARUTI.NS","NESTLEIND.NS","NTPC.NS",
+        "LTM.NS","M&M.NS","MARUTI.NS","NESTLEIND.NS","NTPC.NS",
         "ONGC.NS","POWERGRID.NS","RELIANCE.NS","SBILIFE.NS","SHRIRAMFIN.NS",
         "SBIN.NS","SUNPHARMA.NS","TCS.NS","TATACONSUM.NS","TMPV.NS",
         "TATASTEEL.NS","TECHM.NS","TITAN.NS","ULTRACEMCO.NS","WIPRO.NS",
@@ -80,7 +80,7 @@ CONSTITUENTS = {
         "SBIN.NS","BANKBARODA.NS",
     ],
     "Nifty IT": [
-        "COFORGE.NS","HCLTECH.NS","INFY.NS","LTIMIND.NS","MPHASIS.NS",
+        "COFORGE.NS","HCLTECH.NS","INFY.NS","LTM.NS","MPHASIS.NS",
         "PERSISTENT.NS","TCS.NS","TECHM.NS","WIPRO.NS","OFSS.NS",
     ],
     "Nifty Auto": [
@@ -147,9 +147,14 @@ SCRIPT_DIR         = os.path.dirname(os.path.abspath(__file__))
 CSV_INDEX_PATH     = os.path.join(SCRIPT_DIR, "nifty_data.csv")
 CSV_STOCKS_PATH    = os.path.join(SCRIPT_DIR, "nifty_stocks_data.csv")
 CSV_WATCHLIST_PATH = os.path.join(SCRIPT_DIR, "nifty_watchlist_data.csv")
-HTML_PATH          = os.path.join(SCRIPT_DIR, "index.html")
-WATCHLIST_FILE     = os.path.join(SCRIPT_DIR, "stocks.txt")
-WATCHLIST_KEY      = "\u2605 My Watchlist"   # ★ My Watchlist
+HTML_PATH              = os.path.join(SCRIPT_DIR, "index.html")
+LOOKUP_SERVER_PATH     = os.path.join(SCRIPT_DIR, "lookup_server.py")
+NETLIFY_FUNC_DIR       = os.path.join(SCRIPT_DIR, "netlify", "functions")
+NETLIFY_FUNC_PATH      = os.path.join(NETLIFY_FUNC_DIR, "lookup.js")
+NETLIFY_TOML_PATH      = os.path.join(SCRIPT_DIR, "netlify.toml")
+PACKAGE_JSON_PATH      = os.path.join(SCRIPT_DIR, "package.json")
+WATCHLIST_FILE         = os.path.join(SCRIPT_DIR, "stocks.txt")
+WATCHLIST_KEY          = "\u2605 My Watchlist"   # ★ My Watchlist
 
 # ── Core fetch ────────────────────────────────────────────────────────────────
 def fetch_weekly(ticker):
@@ -323,6 +328,320 @@ def compute_stock_stats(df):
         result[index_name] = compute_stats(sub, name_col="stock_name")
     return result
 
+# ── Lookup infrastructure writers ────────────────────────────────────────────
+def write_netlify_function():
+    """Write netlify/functions/lookup.js — the serverless lookup endpoint."""
+    os.makedirs(NETLIFY_FUNC_DIR, exist_ok=True)
+    code = r"""// netlify/functions/lookup.js
+// Netlify serverless function — called by the dashboard when hosted on Netlify.
+// Fetches 1-year weekly closes from Yahoo Finance and computes the same stats
+// as the Python nifty_refresh.py script.
+//
+// Deploy: just push to your Netlify-linked repo. No config needed.
+// Dependency: yahoo-finance2  (listed in package.json at repo root)
+
+const yahooFinance = require("yahoo-finance2").default;
+
+exports.handler = async (event) => {
+  const headers = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Content-Type": "application/json",
+  };
+
+  if (event.httpMethod === "OPTIONS") {
+    return { statusCode: 200, headers, body: "" };
+  }
+
+  const raw = (event.queryStringParameters || {}).tickers || "";
+  if (!raw.trim()) {
+    return { statusCode: 400, headers, body: JSON.stringify({ error: "No tickers" }) };
+  }
+
+  const tickers = raw.split(",").map(t => {
+    t = t.trim().toUpperCase();
+    if (!t) return null;
+    if (t.startsWith("^") || t.includes(".")) return t;
+    return t + ".NS";
+  }).filter(Boolean);
+
+  const results = [];
+  const errors  = [];
+
+  for (const ticker of tickers) {
+    try {
+      const rows = await fetchWeekly(ticker);
+      if (!rows || rows.length < 3) { errors.push(ticker + " (no data)"); continue; }
+      const stat = computeOne(rows, ticker.replace(".NS", "").replace("^", ""));
+      if (stat) results.push(stat);
+      else errors.push(ticker + " (compute failed)");
+    } catch (e) {
+      errors.push(ticker + " (" + e.message + ")");
+    }
+  }
+
+  return { statusCode: 200, headers, body: JSON.stringify({ results, errors }) };
+};
+
+async function fetchWeekly(ticker) {
+  const result = await yahooFinance.historical(ticker, {
+    period1: (() => { const d = new Date(); d.setFullYear(d.getFullYear() - 1); return d; })(),
+    period2: new Date(),
+    interval: "1wk",
+  });
+  if (!result || result.length < 3) return null;
+  return result
+    .filter(r => r.close && r.close > 0)
+    .map(r => ({
+      date: r.date.toISOString().slice(0, 10),
+      close: Math.round(r.close * 100) / 100,
+    }))
+    .sort((a, b) => a.date.localeCompare(b.date));
+}
+
+function computeOne(rows, displayName) {
+  const closes = rows.map(r => r.close);
+  const dts    = rows.map(r => r.date);
+  const n      = closes.length;
+  const cur    = closes[n - 1];
+  const curDt  = dts[n - 1];
+
+  const w  = k => { const i = n - 1 - k; return i >= 0 ? closes[i] : null; };
+  const wd = k => { const i = n - 1 - k; return i >= 0 ? dts[i]   : null; };
+  const pct = (a, b) => (a == null || b == null || b === 0) ? null : Math.round(((a - b) / b) * 10000) / 100;
+
+  const mom = [];
+  for (let k = 10; k >= 1; k--) {
+    const a = w(k - 1), b = w(k);
+    if (a == null || b == null) mom.push(0);
+    else mom.push(a > b ? 1 : a < b ? -1 : 0);
+  }
+  const score = mom.reduce((s, v) => s + v, 0);
+
+  return {
+    name: displayName, cur, cur_dt: curDt,
+    r1w: pct(cur, w(1)),  r2w: pct(cur, w(2)),
+    r3w: pct(cur, w(3)),  r4w: pct(cur, w(4)),
+    r5w: pct(cur, w(5)),  r6w: pct(cur, w(6)),
+    r6m: pct(cur, w(26)), r1y: pct(cur, closes[0]),
+    c1w: w(1),  c2w: w(2),  c3w: w(3),  c4w: w(4),
+    c5w: w(5),  c6w: w(6),  c6m: w(26), c1y: closes[0],
+    d1w: wd(1), d2w: wd(2), d3w: wd(3), d4w: wd(4),
+    d5w: wd(5), d6w: wd(6), d6m: wd(26),d1y: dts[0],
+    mom, score, momRank: 0,
+  };
+}
+"""
+    with open(NETLIFY_FUNC_PATH, "w", encoding="utf-8") as f:
+        f.write(code)
+    print(f"  Saved \u2192 {NETLIFY_FUNC_PATH}")
+
+
+def write_netlify_toml():
+    """Write netlify.toml — tells Netlify where functions live and sets publish dir."""
+    # Only write if it doesn't already exist (don't clobber user edits)
+    if os.path.exists(NETLIFY_TOML_PATH):
+        print(f"  Skipped {NETLIFY_TOML_PATH} (already exists)")
+        return
+    toml = """\
+[build]
+  publish = "."
+  functions = "netlify/functions"
+
+[functions]
+  node_bundler = "esbuild"
+"""
+    with open(NETLIFY_TOML_PATH, "w", encoding="utf-8") as f:
+        f.write(toml)
+    print(f"  Saved \u2192 {NETLIFY_TOML_PATH}")
+
+
+def write_package_json():
+    """Write package.json with yahoo-finance2 dependency for the Netlify function."""
+    if os.path.exists(PACKAGE_JSON_PATH):
+        print(f"  Skipped {PACKAGE_JSON_PATH} (already exists)")
+        return
+    pkg = """\
+{
+  "name": "equipulse",
+  "version": "1.0.0",
+  "description": "NIFTY Index Dashboard",
+  "dependencies": {
+    "yahoo-finance2": "^2.11.3"
+  }
+}
+"""
+    with open(PACKAGE_JSON_PATH, "w", encoding="utf-8") as f:
+        f.write(pkg)
+    print(f"  Saved \u2192 {PACKAGE_JSON_PATH}")
+
+
+def write_lookup_server():
+    """Write lookup_server.py next to index.html. Run it with: python lookup_server.py"""
+    code = '''"""
+EquiPulse — Runtime Stock Lookup Server
+----------------------------------------
+Run this alongside index.html to enable the live stock lookup feature.
+
+    python lookup_server.py
+
+Listens on http://localhost:7777
+Endpoint: GET /lookup?tickers=HDFCBANK,RELIANCE,INFY
+
+The dashboard calls this automatically when you type a ticker and press Lookup.
+"""
+
+import json, sys
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
+
+import yfinance as yf
+import pandas as pd
+
+
+PORT = 7777
+
+
+def fetch_weekly(ticker):
+    raw = yf.download(ticker, period="1y", interval="1wk",
+                      progress=False, auto_adjust=True)
+    if raw.empty or len(raw) < 3:
+        return None
+    if isinstance(raw.columns, pd.MultiIndex):
+        col = raw["Close"]
+        if isinstance(col, pd.DataFrame):
+            col = col.iloc[:, 0]
+    else:
+        col = raw["Close"]
+    closes = col.dropna()
+    rows = []
+    for dt, close in closes.items():
+        val = float(close)
+        if val <= 0:
+            continue
+        date_str = dt.strftime("%Y-%m-%d") if hasattr(dt, "strftime") else str(dt)[:10]
+        rows.append({"date": date_str, "close": round(val, 2)})
+    return rows
+
+
+def compute_one(ticker, display_name):
+    rows = fetch_weekly(ticker)
+    if not rows or len(rows) < 3:
+        return None
+    closes = [r["close"] for r in rows]
+    dts    = [r["date"]  for r in rows]
+    n = len(closes)
+    cur    = closes[-1]
+    cur_dt = dts[-1]
+
+    def w(k):
+        idx = n - 1 - k
+        return closes[idx] if idx >= 0 else None
+
+    def wd(k):
+        idx = n - 1 - k
+        return dts[idx] if idx >= 0 else None
+
+    def pct(a, b):
+        if a is None or b is None or b == 0:
+            return None
+        return round(((a - b) / b) * 100, 2)
+
+    mom = []
+    for k in range(10, 0, -1):
+        a, b = w(k-1), w(k)
+        if a is None or b is None:
+            mom.append(0)
+        else:
+            mom.append(1 if a > b else (-1 if a < b else 0))
+    score = sum(mom)
+
+    return {
+        "name": display_name, "cur": cur, "cur_dt": cur_dt,
+        "r1w": pct(cur, w(1)),  "r2w": pct(cur, w(2)),
+        "r3w": pct(cur, w(3)),  "r4w": pct(cur, w(4)),
+        "r5w": pct(cur, w(5)),  "r6w": pct(cur, w(6)),
+        "r6m": pct(cur, w(26)), "r1y": pct(cur, closes[0]),
+        "c1w": w(1),  "c2w": w(2),  "c3w": w(3),  "c4w": w(4),
+        "c5w": w(5),  "c6w": w(6),  "c6m": w(26), "c1y": closes[0],
+        "d1w": wd(1), "d2w": wd(2), "d3w": wd(3), "d4w": wd(4),
+        "d5w": wd(5), "d6w": wd(6), "d6m": wd(26),"d1y": dts[0],
+        "mom": mom, "score": score, "momRank": 0,
+    }
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        print("  [lookup]", fmt % args)
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self._cors()
+        self.end_headers()
+
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path != "/lookup":
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        qs = parse_qs(parsed.query)
+        raw_tickers = qs.get("tickers", [""])[0]
+        if not raw_tickers.strip():
+            self._json({"error": "No tickers supplied"}, 400)
+            return
+
+        results = []
+        errors  = []
+        for t in [x.strip() for x in raw_tickers.split(",") if x.strip()]:
+            display = t.upper()
+            ticker  = display if display.endswith(".NS") or display.startswith("^") else display + ".NS"
+            print(f"  Fetching {ticker} ...", end=" ", flush=True)
+            try:
+                stat = compute_one(ticker, display.replace(".NS", ""))
+                if stat:
+                    results.append(stat)
+                    print("OK")
+                else:
+                    errors.append(t + " (no data)")
+                    print("no data")
+            except Exception as e:
+                errors.append(t + " (" + str(e) + ")")
+                print("ERROR:", e)
+
+        self._json({"results": results, "errors": errors})
+
+    def _json(self, obj, code=200):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self._cors()
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+if __name__ == "__main__":
+    print(f"EquiPulse Lookup Server — listening on http://localhost:{PORT}")
+    print("Open index.html in your browser, then use the Lookup bar to query any stock.")
+    print("Press Ctrl+C to stop.\\n")
+    try:
+        HTTPServer(("localhost", PORT), Handler).serve_forever()
+    except KeyboardInterrupt:
+        print("\\nStopped.")
+        sys.exit(0)
+'''
+    with open(LOOKUP_SERVER_PATH, "w", encoding="utf-8") as f:
+        f.write(code)
+    print(f"  Saved \u2192 {LOOKUP_SERVER_PATH}")
+
+
 # ── HTML generation ───────────────────────────────────────────────────────────
 # We build the HTML as a regular string (not f-string) to avoid
 # conflicts between Python's {} and JavaScript's {} and ${}.
@@ -363,7 +682,7 @@ input[type=text]{background:var(--surface2);color:var(--text);border:1px solid v
 input[type=text]:focus{border-color:var(--accent)}
 .notebar{padding:6px 24px;font-size:11px;color:var(--muted);background:var(--surface2);
   border-bottom:1px solid var(--border);font-family:var(--mono)}
-.tbl-wrap{overflow-x:auto}
+.tbl-wrap{overflow-x:auto;overflow-y:auto;height:calc(100vh - 185px)}
 table{width:100%;border-collapse:collapse;min-width:960px;font-size:11.5px}
 thead{position:sticky;top:0;z-index:5}
 th{padding:8px 8px;text-align:right;font-family:var(--mono);font-size:10px;font-weight:500;
@@ -405,6 +724,7 @@ tr:hover td:first-child{background:var(--surface2)}
 .no-data-msg{padding:40px;text-align:center;color:var(--muted);font-family:var(--mono);font-size:12px}
 .legend{display:flex;gap:16px;padding:10px 24px;border-top:1px solid var(--border);
   background:var(--surface);font-size:11px;color:var(--muted);flex-wrap:wrap;align-items:center}
+.sticky-top{position:relative;z-index:50;background:var(--bg)}
 .sort-asc::after{content:" ↑";color:var(--accent)}
 .sort-desc::after{content:" ↓";color:var(--accent)}
 ::-webkit-scrollbar{width:5px;height:5px}
@@ -418,6 +738,34 @@ td{padding:5px 8px;vertical-align:top}
 .watchlist-row td:first-child{background:rgba(99,102,241,0.07)}
 .watchlist-row:hover td:first-child{background:rgba(99,102,241,0.14)}
 .watchlist-sep td{padding:0;height:3px;background:rgba(99,102,241,0.25);border:none}
+/* ── Lookup bar ── */
+.lookup-bar{display:flex;gap:8px;padding:7px 24px;border-bottom:1px solid var(--border);
+  background:var(--surface);align-items:center;flex-wrap:wrap}
+.lookup-bar label{font-size:11px;color:var(--muted);font-family:var(--mono)}
+#lookupInput{width:340px;background:var(--surface2);color:var(--text);
+  border:1px solid rgba(251,191,36,0.35);border-radius:6px;padding:4px 10px;
+  font-size:12px;font-family:var(--mono);outline:none}
+#lookupInput:focus{border-color:rgba(251,191,36,0.8);box-shadow:0 0 0 2px rgba(251,191,36,0.1)}
+#lookupInput::placeholder{color:var(--muted)}
+.lookup-btn{background:rgba(251,191,36,0.15);color:#fbbf24;border:1px solid rgba(251,191,36,0.35);
+  border-radius:6px;padding:4px 14px;cursor:pointer;font-size:12px;font-family:var(--mono);
+  font-weight:500;transition:background 0.15s}
+.lookup-btn:hover{background:rgba(251,191,36,0.28)}
+.lookup-btn:disabled{opacity:0.4;cursor:not-allowed}
+.lookup-clear-btn{background:transparent;color:var(--muted);border:1px solid var(--border2);
+  border-radius:6px;padding:4px 10px;cursor:pointer;font-size:11px;font-family:var(--mono)}
+.lookup-clear-btn:hover{color:var(--text);border-color:var(--muted)}
+#lookupStatus{font-size:11px;font-family:var(--mono);color:var(--muted)}
+#lookupStatus.err{color:var(--red)}
+/* Lookup result rows — amber highlight */
+.lookup-row td{background:rgba(251,191,36,0.06);border-bottom:1px solid rgba(251,191,36,0.18)}
+.lookup-row:hover td{background:rgba(251,191,36,0.12)}
+.lookup-row td:first-child{background:rgba(251,191,36,0.06)}
+.lookup-row:hover td:first-child{background:rgba(251,191,36,0.12)}
+.lookup-sep td{padding:0;height:3px;background:rgba(251,191,36,0.3);border:none}
+.lookup-remove{cursor:pointer;color:var(--muted);font-size:10px;margin-left:6px;
+  opacity:0.6;font-family:var(--mono)}
+.lookup-remove:hover{color:var(--red);opacity:1}
 """
 
     js = """
@@ -564,6 +912,37 @@ function renderTable() {
     h += '<tr class="watchlist-sep"><td colspan="20"></td></tr>';
   }
 
+  // ── Pinned lookup rows (amber, each individually removable) ──────────────
+  if(lookupResults.length > 0) {
+    lookupResults.forEach(r => {
+      const m  = getMom(r.score);
+      const sc = r.score>0?'sa':r.score<0?'sn':'s0';
+      h += '<tr class="lookup-row">';
+      h += '<td style="color:#fbbf24;font-weight:600">'
+         + r.name
+         + ' <span style="font-size:9px;background:rgba(251,191,36,0.2);color:#fbbf24;'
+         + 'border:1px solid rgba(251,191,36,0.4);border-radius:4px;padding:1px 5px;'
+         + 'font-family:var(--mono);font-weight:500;vertical-align:middle">LOOKUP</span>'
+         + ' <span class="lookup-remove" onclick="removeLookupRow(\\'' + r.name + '\\')" title="Remove">&#x2715;</span>'
+         + '</td>';
+      h += '<td class="cur">'+fpr(r.cur)+'</td>';
+      h += pCell(r.r1w, r.c1w, cc(r.r1w));
+      h += pCell(r.r2w, r.c2w, cc(r.r2w));
+      h += pCell(r.r3w, r.c3w, cc(r.r3w));
+      h += pCell(r.r4w, r.c4w, cc(r.r4w));
+      h += pCell(r.r5w, r.c5w, cc(r.r5w));
+      h += pCell(r.r6w, r.c6w, cc(r.r6w));
+      h += pCell(r.r6m, r.c6m, cc(r.r6m));
+      h += pCell(r.r1y, r.c1y, cc(r.r1y));
+      r.mom.forEach(v => { h += momCell(v); });
+      h += '<td class="'+sc+'" style="text-align:center">'+(r.score>0?'+':'')+r.score+'</td>';
+      h += '<td style="text-align:center;color:var(--muted)">'+r.momRank+'</td>';
+      h += '<td style="text-align:center"><span class="badge '+m.c+'">'+m.l+'</span></td>';
+      h += '</tr>';
+    });
+    h += '<tr class="lookup-sep"><td colspan="20"></td></tr>';
+  }
+
   sorted.forEach(r => {
     const m  = getMom(r.score);
     const sc = r.score>0?'sa':r.score<0?'sn':'s0';
@@ -691,6 +1070,108 @@ function fillHeaderDates(data, prefix) {
 }
 fillHeaderDates(INDEX_DATA, 'hd-');
 
+// Set tbl-wrap height so it fills exactly the remaining viewport
+// This makes scroll happen inside tbl-wrap, so thead top:0 always works
+(function setTableHeight() {
+  function resize() {
+    const wrap = document.querySelector('.tbl-wrap');
+    const top  = document.querySelector('.sticky-top');
+    if (!wrap || !top) return;
+    const used = top.getBoundingClientRect().bottom;
+    wrap.style.height = (window.innerHeight - used) + 'px';
+  }
+  resize();
+  window.addEventListener('resize', resize);
+})();
+
+// ── RUNTIME STOCK LOOKUP ──────────────────────────────────────────────────────
+// Auto-detects environment:
+//   Local  → calls http://localhost:7777/lookup  (run: python lookup_server.py)
+//   Netlify → calls /.netlify/functions/lookup   (deployed automatically)
+const LOOKUP_PORT = 7777;
+let lookupResults = [];
+
+function getLookupUrl(tickersCsv) {
+  const h = window.location.hostname;
+  const isLocal = (h === 'localhost' || h === '127.0.0.1' || h === '' || window.location.protocol === 'file:');
+  if (isLocal) {
+    return 'http://localhost:' + LOOKUP_PORT + '/lookup?tickers=' + encodeURIComponent(tickersCsv);
+  }
+  return '/.netlify/functions/lookup?tickers=' + encodeURIComponent(tickersCsv);
+}
+
+async function runLookup() {
+  const raw = document.getElementById('lookupInput').value.trim();
+  if(!raw) return;
+
+  const parts   = raw.replace(/[,\s]+/g, ',').split(',').map(t => t.trim().toUpperCase()).filter(Boolean);
+  const tickers = parts.map(t => (!t.startsWith('^') && !t.includes('.')) ? t + '.NS' : t);
+  if(!tickers.length) return;
+
+  const btn    = document.getElementById('lookupBtn');
+  const status = document.getElementById('lookupStatus');
+  btn.disabled = true;
+  status.className = '';
+  status.textContent = 'Fetching ' + tickers.length + ' ticker(s)\u2026';
+
+  // Skip already-loaded tickers
+  const existing = new Set(lookupResults.map(r => r._ticker));
+  const toFetch  = tickers.filter(t => !existing.has(t));
+  if(!toFetch.length) {
+    status.textContent = 'Already loaded.';
+    btn.disabled = false;
+    return;
+  }
+
+  const isLocal = getLookupUrl('x').startsWith('http://localhost');
+  try {
+    const url  = getLookupUrl(toFetch.join(','));
+    const resp = await fetch(url, {signal: AbortSignal.timeout(30000)});
+    if(!resp.ok) throw new Error('Server returned ' + resp.status);
+    const data = await resp.json();
+
+    if(data.results && data.results.length) {
+      data.results.forEach((r, i) => {
+        r._ticker = toFetch[i] || (r.name + '.NS');
+        r.momRank = i + 1;
+      });
+      lookupResults = [...lookupResults, ...data.results];
+      renderTable();
+      const errtxt = data.errors && data.errors.length ? ' \u00b7 failed: ' + data.errors.join(', ') : '';
+      status.textContent = '\u2713 ' + data.results.length + ' stock(s) loaded' + errtxt;
+    } else {
+      status.className = 'err';
+      status.textContent = 'No data returned. ' + (data.errors||[]).join(', ');
+    }
+  } catch(e) {
+    status.className = 'err';
+    const isFetchErr = e.name === 'TypeError' || (e.message||'').toLowerCase().includes('fetch');
+    if(isLocal && isFetchErr) {
+      status.textContent = '\u26a0 lookup_server.py not running \u2014 start it: python lookup_server.py';
+    } else {
+      status.textContent = 'Error: ' + e.message;
+    }
+  }
+  btn.disabled = false;
+}
+
+function removeLookupRow(name) {
+  lookupResults = lookupResults.filter(r => r.name !== name);
+  if(!lookupResults.length) document.getElementById('lookupStatus').textContent = '';
+  renderTable();
+}
+
+function clearAllLookups() {
+  lookupResults = [];
+  document.getElementById('lookupInput').value = '';
+  document.getElementById('lookupStatus').textContent = '';
+  renderTable();
+}
+
+document.getElementById('lookupInput').addEventListener('keydown', e => {
+  if(e.key === 'Enter') runLookup();
+});
+
 renderTable();
 """
 
@@ -702,6 +1183,7 @@ renderTable();
         '<style>' + css + '</style>\n'
         '</head>\n<body>\n\n'
 
+        '<div class="sticky-top">\n'
         '<div class="topbar">\n'
         '  <div>\n'
         '    <div class="brand">NIFTY INDEX DASHBOARD</div>\n'
@@ -732,9 +1214,21 @@ renderTable();
         '  </select>\n'
         '</div>\n\n'
 
+        '<div class="lookup-bar">\n'
+        '  <label>&#x1f50d; Lookup:</label>\n'
+        '  <input type="text" id="lookupInput" placeholder="DIXON, ZOMATO, DMART  (comma-separated, Enter to fetch)">\n'
+        '  <button class="lookup-btn" id="lookupBtn" onclick="runLookup()">Fetch Live</button>\n'
+        '  <button class="lookup-clear-btn" onclick="clearAllLookups()">Clear</button>\n'
+        '  <span id="lookupStatus"></span>\n'
+        '  <span style="margin-left:auto;font-size:10px;color:var(--muted);font-family:var(--mono)">'
+        'Local: <code style="color:#fbbf24">python lookup_server.py</code>'
+        ' &nbsp;|&nbsp; Netlify: auto via serverless function</span>\n'
+        '</div>\n\n'
+
         '<div class="notebar">Weekly closes (Friday) &nbsp;|&nbsp; Momentum = +1/\u22121 per week over 10 weeks'
         ' &nbsp;|&nbsp; Score = sum &nbsp;|&nbsp; Bull \u2265 +4 &nbsp;|&nbsp; Bear \u2264 \u22124'
-        ' &nbsp;|&nbsp; Click <span style="color:var(--accent)">index name</span> to drill into stocks</div>\n\n'
+        ' &nbsp;|&nbsp; Click <span style="color:var(--accent)">index name</span> to drill into stocks</div>\n'
+'</div>\n\n'
 
         '<div class="tbl-wrap">\n'
         '<table>\n<thead>\n<tr>\n'
@@ -864,8 +1358,42 @@ def main():
         f.write(html)
     print(f"  Saved \u2192 {HTML_PATH}")
 
+    write_lookup_server()
+    write_netlify_function()
+    write_netlify_toml()
+    write_package_json()
+
+    # ── Auto-launch lookup_server.py in the background ────────────────────
+    import subprocess, socket as _sock
+    already_up = False
+    try:
+        with _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM) as s:
+            already_up = (s.connect_ex(("localhost", 7777)) == 0)
+    except Exception:
+        pass
+
+    if already_up:
+        print("\n  Lookup server already running on port 7777 — no restart needed.")
+    else:
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, LOOKUP_SERVER_PATH],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,   # detach: outlives this script
+            )
+            print(f"\n  Lookup server started \u2192 PID {proc.pid}  (port 7777)")
+            if sys.platform == "win32":
+                print(f"  To stop: taskkill /F /PID {proc.pid}")
+            else:
+                print(f"  To stop: kill {proc.pid}")
+        except Exception as e:
+            print(f"\n  Could not auto-start lookup_server.py: {e}")
+            print("  Start it manually in a separate terminal: python lookup_server.py")
+
     # webbrowser.open(f"file://{HTML_PATH}")
     print("\nDone! Click any index name (in accent colour \u2197) to see its constituent stocks.")
+    print("Netlify: push to git \u2192 serverless function deploys automatically.")
     print("Run again next Friday after 5 PM IST.")
     print("=" * 62)
 
